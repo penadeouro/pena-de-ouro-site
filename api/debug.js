@@ -1,13 +1,23 @@
 export default async function handler(req, res) {
-  const response = await fetch(
-    "https://api.tecimob.com.br/v1/properties?status=active&limit=2",
-    {
+  try {
+    const KEY = process.env.TECIMOB_API_KEY;
+    
+    if (!KEY) return res.status(200).json({ erro: "TECIMOB_API_KEY não encontrada nas variáveis de ambiente" });
+
+    const response = await fetch("http://api.tecimob.com.br/api/properties?page=1", {
       headers: {
-        Authorization: `Bearer ${process.env.TECIMOB_API_KEY}`,
+        Authorization: `Bearer ${KEY}`,
         Accept: "application/json",
       },
-    }
-  );
-  const data = await response.json();
-  return res.status(200).json(data);
+    });
+
+    const text = await response.text();
+    return res.status(200).json({ 
+      status: response.status,
+      primeiros_200_chars: text.slice(0, 200)
+    });
+
+  } catch (error) {
+    return res.status(200).json({ erro: error.message });
+  }
 }
