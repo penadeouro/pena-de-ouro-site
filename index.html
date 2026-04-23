@@ -338,6 +338,533 @@
 </div>
 
 <script>
+const fmt = v => v.toLocaleString("pt-BR", { style:"currency", currency:"BRL", maximumFractionDigits:0 });
+
+let geoOrigin = null;   // { lat, lon, bairro, cidade }
+let raioAtual  = 5;     // km selecionado pelo usuário
+let imovelFiltrados = [];
+let conversaHistory = [];
+let buscando = false;
+
+// ─── Geo: só geocodifica o CEP de origem (estoque fica no backend) ────────────
+async function geocodeCep(cep){
+  const clean = cep.replace(/\D/g,"");
+  const via = await fetch(`https://viacep.com.br/ws/${clean}/json/`).then(r=>r.json());
+  if(via.erro) throw new Error("CEP não encontrado. Verifique e tente novamente.");
+  const q = encodeURIComponent(`${via.logradouro||""} ${via.bairro} ${via.localidade} ${via.uf} Brasil`);
+  const nom = await fetch(`https://nominatim.openstreetmap.org/search?q=${q}&format=json&limit=1`,{headers:{"Accept-Language":"pt-BR"}}).then(r=>r.json());
+  if(!nom.length) throw new Error("Não foi possível localizar as coordenadas do CEP.");
+  return { lat:parseFloat(nom[0].lat), lon:parseFloat(nom[0].lon), bairro:via.bairro, cidade:via.localidade };
+}
+
+// ─── Iniciar busca por CEP ───────────────────────────────────────────────────
+async function iniciarBusca(){
+  if(buscando) return;
+  const cep = document.getElementById("cep-input").value.trim();
+  const raio = parseInt(document.getElementById("raio-select").value);
+  if(!cep){ pulseCep(); return; }
+
+  buscando = true;
+  setSearchBtn(true, "Localizando...");
+  limparChat();
+
+  try {
+    geoOrigin = await geocodeCep(cep);
+    raioAtual = raio;
+
+    // Geo banner
+    const banner = document.getElementById("geo-banner");
+    const geoText = document.getElementById("geo-text");
+    geoText.textContent = `Referência: ${geoOrigin.bairro}, ${geoOrigin.cidade} · Raio: ${raio}km`;
+    banner.style.display = "flex";
+
+    adicionarMensagem("ai","Localizei <strong>"+geoOrigin.bairro+"</strong>. Me conte o que você busca — tipo do imóvel, número de quartos, orçamento, alguma característica especial — e vou indicar as melhores opções próximas a você.");
+
+    conversaHistory = [];
+    document.getElementById("free-input").focus();
+
+  } catch(e){
+    adicionarMensagem("ai","<span style='color:#991B1B'>"+e.message+"</span>");
+  }
+
+  buscando = false;
+  setSearchBtn(false, "Buscar");
+}
+
+// ─── Enviar mensagem livre ───────────────────────────────────────────────────
+async function enviarMensagem(){
+  if(buscando) return;
+  const input = document.getElementById("free-input");
+  const texto = input.value.trim();
+  if(!texto) return;
+  if(!geoOrigin){ adicionarMensagem("ai","Informe primeiro o CEP de referência e clique em Buscar."); return; }
+
+  input.value = "";
+  adicionarMensagem("user", texto);
+  conversaHistory.push({ role:"user", content:texto });
+
+  buscando = true;
+  setSendBtn(true);
+  const loadId = adicionarLoading();
+
+  try {
+    const systemPrompt = `Você é o assistente de busca imobiliária da Pena de Ouro, imobiliária em Araçatuba-SP. Seu tom é refinado, acolhedor e profissional — como um corretor experiente e atencioso.
+
+Instruções:
+- Recomende imóveis do estoque com base no perfil descrito pelo cliente.
+- Justifique cada recomendação de forma personalizada e humana.
+- Se nenhum imóvel for adequado, diga com gentileza e sugira alternativas (ampliar raio, ajustar perfil).
+- Responda em JSON. Formato:
+{
+  "texto": "resposta conversacional em HTML (use <p>, <strong> se necessário)",
+  "recomendacoes": [
+    { "indice": 0, "match": 95, "justificativa": "..." }
+  ],
+  "alerta": "dica opcional ao cliente (string ou null)"
+}
+- Máximo 3 recomendações. Se não houver recomendações, use array vazio.
+- Responda APENAS o JSON, sem markdown.`;
+
+    // Envia coordenadas de origem + raio para o backend filtrar o estoque Tecimob
+    const response = await fetch("/api/chat", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        system: systemPrompt,
+        messages: conversaHistory,
+        originLat: geoOrigin.lat,
+        originLon: geoOrigin.lon,
+        raio: raioAtual
+      })
+    });
+
+    removeLoading(loadId);
+
+    if(!response.ok) throw new Error("Erro ao conectar com o assistente.");
+    const data = await response.json();
+
+    // Atualiza lista local de imóveis filtrados retornados pelo backend
+    if(data.imoveis && data.imoveis.length) {
+      imovelFiltrados = data.imoveis;
+      document.getElementById("geo-text").textContent =
+        `Referência: ${geoOrigin.bairro}, ${geoOrigin.cidade} · ${imovelFiltrados.length} imóvel(is) em até ${raioAtual}km`;
+    }
+
+    const parsed = JSON.parse(data.content.replace(/```json|```/g,"").trim());
+
+    conversaHistory.push({ role:"assistant", content: JSON.stringify(parsed) });
+    renderResposta(parsed);
+
+  } catch(e){
+    removeLoading(loadId);
+    adicionarMensagem("ai","<span style='color:#991B1B'>Não foi possível processar sua mensagem. Tente novamente em instantes.</span>");
+  }
+
+  buscando = false;
+  setSendBtn(false);
+}
+
+// ─── Render ──────────────────────────────────────────────────────────────────
+function renderResposta(parsed){
+  const msgs = document.getElementById("messages");
+  const div = document.createElement("div");
+  div.className = "msg";
+  div.innerHTML = `
+    <div class="msg-avatar ai">PO</div>
+    <div class="msg-body">
+      <div class="msg-name">Assistente Pena de Ouro</div>
+      <div class="msg-text">${parsed.texto}</div>
+      ${parsed.recomendacoes?.length ? renderImoveis(parsed.recomendacoes) : ""}
+      ${parsed.alerta ? `<div class="alerta-box"><div class="alerta-label">Dica</div>${parsed.alerta}</div>` : ""}
+    </div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function renderImoveis(recs){
+  return `<div class="imovel-list">${recs.map((rec,i)=>{
+    const im = imovelFiltrados[rec.indice];
+    if(!im) return "";
+    return `<div class="imovel-card">
+      <div class="imovel-rank">${i+1}</div>
+      <div class="imovel-info">
+        <div class="title">${im.titulo}</div>
+        <div class="detail">${im.bairro} · ${im.tipo}${im.dorms>0?" · "+im.dorms+" dorms":""} · ${im.desc}</div>
+        <div class="preco">${fmt(im.preco)}</div>
+        <div class="tags">
+          <span class="tag tag-dist">📍 ${im.dist}km</span>
+          <span class="tag tag-match">✓ ${rec.match}% compatível</span>
+        </div>
+        <div class="justificativa">${rec.justificativa}</div>
+      </div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
+function adicionarMensagem(role, html){
+  const msgs = document.getElementById("messages");
+  const isFirst = msgs.children.length === 0;
+  if(isFirst) msgs.style.cssText = "";
+  const div = document.createElement("div");
+  div.className = "msg";
+  div.innerHTML = `
+    <div class="msg-avatar ${role}">${role==="ai"?"PO":"Eu"}</div>
+    <div class="msg-body">
+      <div class="msg-name">${role==="ai"?"Assistente Pena de Ouro":"Você"}</div>
+      <div class="msg-text"><p>${html}</p></div>
+    </div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function adicionarLoading(){
+  const msgs = document.getElementById("messages");
+  const id = "load-"+Date.now();
+  const div = document.createElement("div");
+  div.className = "msg"; div.id = id;
+  div.innerHTML = `
+    <div class="msg-avatar ai">PO</div>
+    <div class="msg-body">
+      <div class="msg-name">Assistente Pena de Ouro</div>
+      <div class="loading-row"><div class="dot-anim"><span></span><span></span><span></span></div></div>
+    </div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  return id;
+}
+
+function removeLoading(id){ document.getElementById(id)?.remove(); }
+function limparChat(){
+  document.getElementById("messages").innerHTML = "";
+  document.getElementById("geo-banner").style.display = "none";
+}
+function setSearchBtn(loading, label){
+  const btn = document.getElementById("search-btn");
+  btn.disabled = loading;
+  btn.innerHTML = loading
+    ? `<div class="dot-anim"><span></span><span></span><span></span></div>`
+    : `<svg viewBox="0 0 16 16" fill="none" style="width:14px;height:14px"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M10 10l3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg> ${label}`;
+}
+function setSendBtn(disabled){ document.getElementById("send-btn").disabled = disabled; }
+function pulseCep(){
+  const el = document.getElementById("cep-input");
+  el.style.borderColor = "#B8975A";
+  el.focus();
+  setTimeout(()=>el.style.borderColor="",1500);
+}
+
+// Formata CEP enquanto digita
+document.getElementById("cep-input").addEventListener("input", function(){
+  let v = this.value.replace(/\D/g,"");
+  if(v.length>5) v = v.slice(0,5)+"-"+v.slice(5,8);
+  this.value = v;
+});
+</script>
+</body>
+</html>        radial-gradient(ellipse 80% 50% at 10% 0%, rgba(184,151,90,0.07) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 90% 100%, rgba(184,151,90,0.05) 0%, transparent 60%);
+      pointer-events: none; z-index: 0;
+    }
+
+    /* ── Layout ── */
+    .page { min-height: 100vh; display: flex; flex-direction: column; position: relative; z-index: 1; }
+
+    /* ── Header ── */
+    header {
+      padding: 28px 40px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 20px;
+      background: rgba(250,246,238,0.85); backdrop-filter: blur(12px);
+      position: sticky; top: 0; z-index: 100;
+    }
+    .logo-mark {
+      width: 44px; height: 44px;
+      border: 1px solid var(--gold);
+      border-radius: 2px;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .logo-mark svg { width: 22px; height: 22px; }
+    .brand-name {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: 22px; font-weight: 400; letter-spacing: 0.04em;
+      color: var(--dark);
+    }
+    .brand-name em { color: var(--gold); font-style: normal; }
+    .brand-sub { font-size: 11px; color: var(--text-muted); letter-spacing: 0.12em; text-transform: uppercase; margin-top: 1px; }
+    .header-tag {
+      margin-left: auto;
+      font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+      color: var(--gold); border: 1px solid var(--border);
+      padding: 5px 14px; border-radius: 20px;
+    }
+
+    /* ── Hero ── */
+    .hero {
+      padding: 60px 40px 40px;
+      max-width: 760px; margin: 0 auto; width: 100%;
+      animation: fadeUp 0.6s ease both;
+    }
+    .hero-label {
+      font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+      color: var(--gold); margin-bottom: 16px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .hero-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+    h1 {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: clamp(32px, 5vw, 52px);
+      font-weight: 300; line-height: 1.15;
+      color: var(--dark); margin-bottom: 16px;
+    }
+    h1 em { color: var(--gold); font-style: italic; }
+    .hero-desc { font-size: 15px; color: var(--text-muted); line-height: 1.7; max-width: 520px; }
+
+    /* ── Search card ── */
+    .search-card {
+      max-width: 760px; margin: 0 auto 20px; width: 100%; padding: 0 40px;
+      animation: fadeUp 0.6s 0.1s ease both; opacity: 0;
+    }
+    .card-inner {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      box-shadow: 0 4px 40px rgba(26,22,18,0.06);
+    }
+    .card-fields {
+      display: grid; grid-template-columns: 1fr 130px auto;
+      gap: 0; border-bottom: 1px solid var(--border);
+    }
+    .field {
+      padding: 18px 20px;
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; gap: 5px;
+    }
+    .field:last-child { border-right: none; padding: 14px 16px; justify-content: center; }
+    .field-label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); }
+    .field input, .field select {
+      border: none; outline: none; background: transparent;
+      font-family: 'DM Sans', sans-serif; font-size: 15px; font-weight: 400;
+      color: var(--dark); width: 100%; padding: 0;
+    }
+    .field select { cursor: pointer; }
+    .field input::placeholder { color: #C4B49E; }
+    .search-btn {
+      background: var(--dark); color: var(--gold);
+      border: none; cursor: pointer;
+      font-family: 'DM Sans', sans-serif; font-size: 12px;
+      letter-spacing: 0.1em; text-transform: uppercase; font-weight: 500;
+      padding: 0 24px; white-space: nowrap;
+      transition: background 0.2s;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .search-btn:hover { background: var(--dark-soft); }
+    .search-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .search-btn svg { width: 14px; height: 14px; }
+
+    /* ── Chat area ── */
+    .chat-wrap {
+      max-width: 760px; margin: 0 auto; width: 100%; padding: 0 40px 60px;
+      animation: fadeUp 0.6s 0.2s ease both; opacity: 0;
+    }
+    .chat-box {
+      background: #fff; border: 1px solid var(--border); border-radius: 4px;
+      box-shadow: 0 4px 40px rgba(26,22,18,0.06);
+      overflow: hidden;
+    }
+    .chat-header {
+      padding: 14px 20px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 10px;
+    }
+    .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--gold); animation: pulse 2s infinite; }
+    .chat-header-label { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); }
+    .messages { min-height: 180px; max-height: 420px; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 20px; }
+    .messages:empty::before {
+      content: 'Informe o CEP e o perfil desejado acima para iniciar a busca.';
+      display: block; color: var(--text-muted); font-size: 14px;
+      font-style: italic; text-align: center; margin: auto; padding: 30px 0;
+    }
+
+    /* ── Message bubbles ── */
+    .msg { display: flex; gap: 12px; animation: fadeUp 0.3s ease both; }
+    .msg-avatar {
+      width: 32px; height: 32px; border-radius: 2px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: 11px;
+      letter-spacing: 0.05em; font-weight: 500; margin-top: 2px;
+    }
+    .msg-avatar.ai { background: var(--dark); color: var(--gold); }
+    .msg-avatar.user { background: var(--gold-pale); color: var(--gold); }
+    .msg-body { flex: 1; }
+    .msg-name { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 6px; }
+    .msg-text { font-size: 14px; line-height: 1.7; color: var(--dark); }
+    .msg-text p { margin-bottom: 8px; }
+    .msg-text p:last-child { margin-bottom: 0; }
+
+    /* ── Imovel cards ── */
+    .imovel-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+    .imovel-card {
+      border: 1px solid var(--border); border-radius: 4px; padding: 14px 16px;
+      display: flex; gap: 14px; align-items: flex-start;
+      background: var(--cream); transition: border-color 0.2s;
+    }
+    .imovel-card:hover { border-color: var(--gold-light); }
+    .imovel-rank {
+      width: 28px; height: 28px; background: var(--dark); color: var(--gold);
+      border-radius: 2px; display: flex; align-items: center; justify-content: center;
+      font-family: 'Cormorant Garamond', serif; font-size: 16px; font-weight: 400; flex-shrink: 0;
+    }
+    .imovel-info .title { font-size: 14px; font-weight: 500; color: var(--dark); margin-bottom: 3px; }
+    .imovel-info .detail { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+    .imovel-info .preco { font-family: 'Cormorant Garamond', serif; font-size: 18px; color: var(--gold); margin-top: 6px; }
+    .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .tag { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; padding: 2px 8px; border-radius: 20px; }
+    .tag-dist { background: var(--gold-pale); color: var(--gold); }
+    .tag-match { background: #ECFDF5; color: #065F46; }
+    .justificativa { font-size: 12px; color: var(--text-muted); margin-top: 8px; line-height: 1.6; font-style: italic; }
+
+    /* ── Alert box ── */
+    .alerta-box {
+      margin-top: 14px; padding: 12px 16px;
+      border-left: 2px solid var(--gold); background: var(--gold-pale);
+      border-radius: 0 4px 4px 0; font-size: 13px; color: var(--dark-soft); line-height: 1.6;
+    }
+    .alerta-label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--gold); margin-bottom: 4px; }
+
+    /* ── Geo info ── */
+    .geo-info {
+      padding: 10px 20px; background: var(--gold-pale); border-bottom: 1px solid var(--border);
+      font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 8px;
+    }
+    .geo-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gold); flex-shrink: 0; }
+
+    /* ── Loading ── */
+    .loading-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
+    .dot-anim span {
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      background: var(--gold); margin: 0 2px;
+      animation: bounce 1.2s infinite;
+    }
+    .dot-anim span:nth-child(2) { animation-delay: 0.2s; }
+    .dot-anim span:nth-child(3) { animation-delay: 0.4s; }
+
+    /* ── Error ── */
+    .error-msg { font-size: 13px; color: #991B1B; padding: 10px 16px; background: #FEF2F2; border-radius: 4px; margin-top: 8px; }
+
+    /* ── Input bar ── */
+    .input-bar {
+      border-top: 1px solid var(--border); padding: 14px 20px;
+      display: flex; gap: 10px; align-items: center;
+    }
+    .free-input {
+      flex: 1; border: 1px solid var(--border); border-radius: 4px;
+      padding: 10px 14px; font-family: 'DM Sans', sans-serif; font-size: 14px;
+      color: var(--dark); background: var(--cream); outline: none;
+      transition: border-color 0.2s;
+    }
+    .free-input:focus { border-color: var(--gold-light); }
+    .free-input::placeholder { color: #C4B49E; }
+    .send-btn {
+      background: var(--dark); color: var(--gold); border: none; cursor: pointer;
+      width: 40px; height: 40px; border-radius: 4px; display: flex; align-items: center; justify-content: center;
+      transition: background 0.2s; flex-shrink: 0;
+    }
+    .send-btn:hover { background: var(--dark-soft); }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Animations ── */
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    @keyframes bounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      header { padding: 20px; }
+      .hero, .search-card, .chat-wrap { padding-left: 20px; padding-right: 20px; }
+      .card-fields { grid-template-columns: 1fr; }
+      .field { border-right: none; border-bottom: 1px solid var(--border); }
+      .field:last-child { border-bottom: none; }
+      .search-btn { padding: 16px 20px; width: 100%; justify-content: center; }
+      .hero { padding-top: 36px; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <header>
+    <div class="logo-mark">
+      <svg viewBox="0 0 22 22" fill="none">
+        <path d="M11 2L2 9v11h6V14h6v6h6V9L11 2z" fill="#B8975A"/>
+        <path d="M11 2l2.5 4L11 7.5 8.5 6 11 2z" fill="#8C6E3A" opacity="0.6"/>
+      </svg>
+    </div>
+    <div>
+      <div class="brand-name">Pena de <em>Ouro</em></div>
+      <div class="brand-sub">Imóveis · Araçatuba</div>
+    </div>
+    <div class="header-tag">Busca com IA</div>
+  </header>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="hero-label">Encontre o imóvel certo</div>
+    <h1>Descreva o que você<br/>busca. A <em>IA encontra.</em></h1>
+    <p class="hero-desc">Informe o bairro de referência e conte como é o imóvel dos seus sonhos. Nossa inteligência artificial cruza o seu perfil com o estoque disponível e sugere as melhores opções — incluindo bairros próximos que talvez você não conhecesse.</p>
+  </div>
+
+  <!-- Search -->
+  <div class="search-card">
+    <div class="card-inner">
+      <div class="card-fields">
+        <div class="field">
+          <span class="field-label">CEP de referência</span>
+          <input id="cep-input" type="text" placeholder="Ex: 16015-000" maxlength="9" />
+        </div>
+        <div class="field">
+          <span class="field-label">Raio de busca</span>
+          <select id="raio-select">
+            <option value="3">até 3 km</option>
+            <option value="5" selected>até 5 km</option>
+            <option value="8">até 8 km</option>
+            <option value="12">até 12 km</option>
+          </select>
+        </div>
+        <div class="field">
+          <button class="search-btn" id="search-btn" onclick="iniciarBusca()">
+            <svg viewBox="0 0 16 16" fill="none"><circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M10 10l3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            Buscar
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chat -->
+  <div class="chat-wrap">
+    <div class="chat-box">
+      <div class="chat-header">
+        <div class="pulse"></div>
+        <span class="chat-header-label">Assistente Pena de Ouro</span>
+      </div>
+      <div id="geo-banner" style="display:none" class="geo-info">
+        <div class="geo-dot"></div>
+        <span id="geo-text"></span>
+      </div>
+      <div class="messages" id="messages"></div>
+      <div class="input-bar">
+        <input class="free-input" id="free-input" placeholder="Descreva o imóvel ideal — quartos, quintal, financiamento, escola perto..." onkeydown="if(event.key==='Enter')enviarMensagem()" />
+        <button class="send-btn" id="send-btn" onclick="enviarMensagem()">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8l12-6-6 12V9L2 8z" fill="#B8975A"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
 // ─── Estoque simulado (substitua por chamada à API Tecimob) ───────────────────
 const ESTOQUE = [
   { id:1, titulo:"Av. Bandeirantes, 450",     tipo:"Casa",        dorms:3, preco:435000, cep:"16015-000", bairro:"Jardim Paulista",   desc:"Quintal 180m², vaga coberta, próx. escola" },
